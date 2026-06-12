@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# 运行时自动下载的大模型(无需入库)
+assets/face_landmarker.task
+assets/canonical_face_model.obj
+
+# 第三方面具图片(版权): 自备 anon_src.png 后运行 scripts/make_anon_asset.py 生成
+assets/anon_src.png
+assets/anon_mask.png
+assets/anon_anchors.json
