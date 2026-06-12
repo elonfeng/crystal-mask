@@ -56,9 +56,6 @@ class MaskWarper:
         order = np.argsort(-meanz)
 
         out = np.zeros((H, W, 3), np.uint8)
-        # 先用面具白色把整个轮廓填满打底 -> 网格没覆盖的边角显示白色而非黑洞
-        rim_poly = S[N_FACE:].astype(np.int32)
-        cv2.fillPoly(out, [rim_poly], (236, 236, 236), cv2.LINE_AA)
         tex = self.tex
         for k in order:
             av = float(a_tri[k])
