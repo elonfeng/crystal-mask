@@ -98,10 +98,18 @@ class MaskWarper:
 
         out = self._rim_shadow(out)                            # 下巴/下颌边缘柔和压暗 -> 立体感
 
-        if jaw > 0.035:                                        # 微张即盖黑(阈值放低), 范围放大盖住白唇
-            poly = (lms[INNER_LIP, :2] * [W, H]).astype(np.float32)
-            cen2 = poly.mean(0)
-            poly = (cen2 + (poly - cen2) * 1.32).astype(np.int32)
+        # 张嘴盖黑(露黑缝): 用"内唇上下缝/嘴宽=张口度"驱动, 取自已平滑的关键点, 比 jawOpen 稳不闪;
+        # 盖黑随张口放大, 且纵向多覆盖 -> 张大嘴/露牙时不会漏白
+        gap = abs(float(lms[13][1] - lms[14][1]))              # 内唇上中13/下中14 纵向缝(归一化)
+        mw = abs(float(lms[78][0] - lms[308][0])) + 1e-6       # 嘴角78/308 嘴宽(自归一脸大小)
+        openness = gap / mw
+        drive = max(openness, float(jaw))                     # jawOpen 作兜底
+        if drive > 0.12:
+            mo = lms[INNER_LIP, :2] * [W, H]
+            cen2 = mo.mean(0)
+            m = min(drive, 0.6)
+            scale = np.array([1.15 + m * 0.5, 1.30 + m * 1.0], np.float32)   # 纵向扩更多盖上下牙
+            poly = (cen2 + (mo - cen2) * scale).astype(np.int32)
             cv2.fillPoly(out, [poly], (0, 0, 0), cv2.LINE_AA)
         return out
 
