@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Anonymous(V字仇杀队)面具：把真实面具图贴到你脸上并跟随头部(刚性, 像真戴塑料面具)。
+"""Anonymous 面具：屏幕上一个面具(纯黑背景), 表情跟随你本人(你张嘴它张嘴)。
 
 用法:
-    python run.py --no-vcam        # 看预览(默认: 面具贴在你真实画面上)
+    python run.py --no-vcam        # 看预览
     python run.py                  # 同时输出虚拟摄像头(需 OBS) 给 Zoom/腾讯会议/Meet
-    python run.py --void           # 黑底, 面具浮在虚空(不显示真实背景)
     python run.py --camera 1       # 指定摄像头
 按 q 退出。
 """
 import argparse
-import json
+import os
 import time
 
 import cv2
@@ -17,14 +16,10 @@ import numpy as np
 
 import config
 from src.tracker import FaceTracker
-
-# 用户眼睛(虹膜中心): MediaPipe 478点里 468=左虹膜 473=右虹膜; 不足则用眼角均值兜底
-L_IRIS, R_IRIS = 468, 473
-L_EYE_CORNERS, R_EYE_CORNERS = [33, 133], [362, 263]
+from src.maskwarp import MaskWarper
 
 
 def open_camera(index, w, h):
-    """macOS 强制 AVFoundation 后端, 并逐序号兜底。"""
     attempts = [(index, cv2.CAP_AVFOUNDATION), (index, cv2.CAP_ANY)]
     for i in (0, 1, 2):
         if i != index:
@@ -53,45 +48,20 @@ def open_vcam(w, h, fps):
         return None
 
 
-def user_eyes(lms, w, h):
-    """返回用户左右眼中心(按屏幕x排序)的像素坐标。"""
-    if len(lms) > max(L_IRIS, R_IRIS):
-        e1, e2 = lms[L_IRIS, :2], lms[R_IRIS, :2]
-    else:
-        e1 = lms[L_EYE_CORNERS, :2].mean(0)
-        e2 = lms[R_EYE_CORNERS, :2].mean(0)
-    pts = np.array([[e1[0] * w, e1[1] * h], [e2[0] * w, e2[1] * h]], np.float32)
-    return pts[pts[:, 0].argsort()]
-
-
-def similarity_from_eyes(mask_l, mask_r, usr_l, usr_r):
-    """两对眼睛点 -> 相似变换(缩放+旋转+平移)的 2x3 仿射矩阵。"""
-    vm, vu = mask_r - mask_l, usr_r - usr_l
-    s = (np.linalg.norm(vu) + 1e-6) / (np.linalg.norm(vm) + 1e-6)
-    ang = np.arctan2(vu[1], vu[0]) - np.arctan2(vm[1], vm[0])
-    cos, sin = np.cos(ang) * s, np.sin(ang) * s
-    t = usr_l - np.array([[cos, -sin], [sin, cos]], np.float32) @ mask_l
-    return np.array([[cos, -sin, t[0]], [sin, cos, t[1]]], np.float32)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--camera', type=int, default=config.CAM_INDEX)
     ap.add_argument('--width', type=int, default=config.WIDTH)
     ap.add_argument('--height', type=int, default=config.HEIGHT)
     ap.add_argument('--no-vcam', action='store_true')
-    ap.add_argument('--void', action='store_true', help='黑底(默认贴在真实画面上)')
     args = ap.parse_args()
     W, H = args.width, args.height
 
-    mask = cv2.imread('assets/anon_mask.png', cv2.IMREAD_UNCHANGED)   # BGRA
-    if mask is None or mask.shape[2] != 4:
-        print("[err] 缺少 assets/anon_mask.png。先把面具图放到 assets/anon_src.png，"
-              "再跑: python scripts/make_anon_asset.py")
+    if not (os.path.exists('assets/anon_src.png') and os.path.exists('assets/anon_rig3d.npz')):
+        print("[err] 缺少面具素材。先把面具图放到 assets/anon_src.png，再跑:")
+        print("       python scripts/make_anon_asset.py")
         return
-    anc = json.load(open('assets/anon_anchors.json'))
-    mask_l = np.array(anc['leye'], np.float32)
-    mask_r = np.array(anc['reye'], np.float32)
+    warper = MaskWarper('assets/anon_src.png', 'assets/anon_rig3d.npz')
 
     cap = open_camera(args.camera, W, H)
     if cap is None:
@@ -101,9 +71,10 @@ def main():
     vcam = None if args.no_vcam else open_vcam(W, H, config.FPS)
 
     smooth = None
+    jaw_s = 0.0
     t0 = time.monotonic()
     last_ts = -1
-    print("[run] Anonymous 面具已启动，按 q 退出。" + ("  (黑底)" if args.void else "  (贴真实画面)"))
+    print("[run] Anonymous 面具已启动（纯黑底·跟随头部·张嘴露黑缝），按 q 退出。")
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -117,16 +88,14 @@ def main():
         last_ts = ts
         res = tracker.process(rgb, ts)
 
-        canvas = np.zeros((H, W, 3), np.uint8) if args.void else frame.copy()
         if res is not None:
-            eyes = user_eyes(res[0], W, H)
-            smooth = eyes if smooth is None else 0.5 * eyes + 0.5 * smooth
-            M = similarity_from_eyes(mask_l, mask_r, smooth[0], smooth[1])
-            warped = cv2.warpAffine(mask, M, (W, H), flags=cv2.INTER_LINEAR,
-                                    borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
-            a = warped[:, :, 3:4].astype(np.float32) / 255.0
-            canvas[:] = (warped[:, :, :3].astype(np.float32) * a
-                         + canvas.astype(np.float32) * (1 - a)).astype(np.uint8)
+            lms = res[0]                                    # (478,3) 归一化
+            smooth = lms if smooth is None else 0.5 * lms + 0.5 * smooth
+            jaw = res[1].get('jawOpen', 0.0) if res[1] else 0.0
+            jaw_s = 0.4 * jaw + 0.6 * jaw_s                 # 张嘴平滑
+            canvas = warper.render(smooth, jaw_s, W, H)
+        else:
+            canvas = np.zeros((H, W, 3), np.uint8)
 
         cv2.imshow('Anonymous mask  (q quit)', canvas)
         if vcam is not None:

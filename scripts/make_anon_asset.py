@@ -1,65 +1,106 @@
 # -*- coding: utf-8 -*-
-"""把一张正脸面具照(assets/anon_src.png, 黑/暗背景)抠成透明背景, 并自动定位两只眼洞当锚点。
-生成 assets/anon_mask.png(RGBA) + assets/anon_anchors.json, 供 anon.py 使用。
+"""把正脸面具照(assets/anon_src.png)处理成"完整面具网格"用素材：
+  - 面具图检测 478 关键点(取前468) = 贴图坐标 UV
+  - 官方人脸网格拓扑(898 三角)
+  - 沿脸轮廓(face oval)向外测到面具真实边缘 -> 每点延伸比例 ratio
+    (用来补全脸缘外的白色塑料外沿: 额头顶/两颊/下巴底, 让面具完整闭合)
+  -> assets/anon_rig3d.npz (uv, tris, oval, ratios)；纹理用 anon_src.png
 
-用法: 把你的面具图放到 assets/anon_src.png, 然后:
-    python scripts/make_anon_asset.py
+用法: 面具图放到 assets/anon_src.png, 然后 python scripts/make_anon_asset.py
 """
-import json
 import os
 import sys
 
 import cv2
 import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config
+from src.tracker import ensure_model
 
 SRC = "assets/anon_src.png"
-OUT = "assets/anon_mask.png"
-ANC = "assets/anon_anchors.json"
+# 脸轮廓(有序闭环)
+OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379,
+        378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127,
+        162, 21, 54, 103, 67, 109]
 
 
-def main():
-    if not os.path.exists(SRC):
-        print(f"[err] 缺少 {SRC}（把你的面具照命名为 anon_src.png 放进 assets/）")
-        sys.exit(1)
-    img = cv2.imread(SRC)
+def load_canonical_tris(path):
+    tris = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith('f '):
+                tris.append([int(t.split('/')[0]) - 1 for t in line.split()[1:4]])
+    return np.array(tris, np.int32)
+
+
+def silhouette(img):
     H, W = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # 1) 亮区=面具主体 -> 取最大连通域
     th = (gray > 38).astype(np.uint8) * 255
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     ncc, lab, stats, _ = cv2.connectedComponentsWithStats(th)
     big = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
     body = (lab == big).astype(np.uint8) * 255
-
-    # 2) 填内部洞(眼洞/眉毛/胡子并入剪影, 保留原色)
     ff = body.copy()
     cv2.floodFill(ff, np.zeros((H + 2, W + 2), np.uint8), (0, 0), 255)
-    holes = cv2.bitwise_not(ff)
-    sil = cv2.bitwise_or(body, holes)
+    return cv2.bitwise_or(body, cv2.bitwise_not(ff))
 
-    # 3) 上半部最大的两个洞 = 眼睛
-    nh, _, hs, hc = cv2.connectedComponentsWithStats(holes)
-    cands = [(hs[i, cv2.CC_STAT_AREA], tuple(hc[i])) for i in range(1, nh)
-             if hc[i][1] < 0.52 * H and hs[i, cv2.CC_STAT_AREA] > 200]
-    cands.sort(reverse=True)
-    if len(cands) < 2:
-        print("[warn] 没找到两只眼洞，改用经验位置(脸宽34%/66%, 高42%)")
-        eyes = [(0.34 * W, 0.42 * H), (0.66 * W, 0.42 * H)]
-    else:
-        eyes = sorted([c for _, c in cands[:2]], key=lambda p: p[0])
 
-    # 4) alpha: 内缩1px去黑边 + 轻羽化
-    alpha = cv2.GaussianBlur(cv2.erode(sil, np.ones((3, 3), np.uint8)), (0, 0), 1.2)
-    cv2.imwrite(OUT, np.dstack([img, alpha]))
+def main():
+    if not os.path.exists(SRC):
+        print(f"[err] 缺少 {SRC}（把面具照命名为 anon_src.png 放进 assets/）")
+        sys.exit(1)
+    ensure_model(config.MODEL_PATH, config.MODEL_URL)
+    ensure_model(config.CANON_OBJ, config.CANON_URL)
+    img = cv2.imread(SRC)
+    H, W = img.shape[:2]
+    sil = silhouette(img)
 
-    ys, xs = np.where(sil > 0)
-    cx = float((xs.min() + xs.max()) / 2)
-    json.dump(dict(leye=list(map(float, eyes[0])), reye=list(map(float, eyes[1])),
-                   top=[cx, float(ys.min())], bottom=[cx, float(ys.max())], W=W, H=H),
-              open(ANC, "w"))
-    print(f"[ok] 生成 {OUT} 和 {ANC}；眼锚点 "
-          f"{tuple(round(v) for v in eyes[0])} {tuple(round(v) for v in eyes[1])}")
+    base = python.BaseOptions(model_asset_path=config.MODEL_PATH)
+    lm = vision.FaceLandmarker.create_from_options(
+        vision.FaceLandmarkerOptions(base_options=base, num_faces=1))
+    res = lm.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
+                             data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
+    if not res.face_landmarks:
+        print("[err] 面具图上没检测到人脸，换一张更清晰的正脸面具照")
+        sys.exit(1)
+    uv = np.array([[l.x * W, l.y * H] for l in res.face_landmarks[0]], np.float32)[:468]
+    tris = load_canonical_tris(config.CANON_OBJ)
+
+    cen = uv.mean(0)
+    ratios = []
+    for idx in OVAL:
+        d = uv[idx] - cen
+        L = float(np.linalg.norm(d))
+        if L < 1:
+            ratios.append(1.0)
+            continue
+        u = d / L
+        r_edge = L
+        r = L
+        while r < L * 2.3:                       # 从轮廓点向外测到面具边缘(剪影外缘)
+            px, py = cen + u * r
+            if 0 <= int(px) < W and 0 <= int(py) < H and sil[int(py), int(px)] > 0:
+                r_edge = r
+                r += 2
+            else:
+                break
+        ratios.append(min(2.3, max(1.0, r_edge / L)))
+
+    # 闭环平滑 + 下限: 消除下巴/边缘的凹口, 让外沿平滑闭合
+    ratios = np.maximum(np.array(ratios, np.float32), 1.08)
+    n = len(ratios)
+    sm = np.array([ratios[(np.arange(i - 2, i + 3)) % n].mean() for i in range(n)], np.float32)
+    ratios = sm
+
+    np.savez("assets/anon_rig3d.npz", uv=uv, tris=tris,
+             oval=np.array(OVAL, np.int32), ratios=ratios)
+    print(f"[ok] anon_rig3d.npz  锚点468 三角{len(tris)} 轮廓{len(OVAL)} "
+          f"延伸比例{np.round(np.array(ratios), 2).tolist()}")
 
 
 if __name__ == "__main__":

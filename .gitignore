@@ -11,7 +11,9 @@ __pycache__/
 assets/face_landmarker.task
 assets/canonical_face_model.obj
 
-# 第三方面具图片(版权): 自备 anon_src.png 后运行 scripts/make_anon_asset.py 生成
+# 第三方面具图片(版权)及其派生数据: 自备 anon_src.png 后跑 scripts/make_anon_asset.py 生成
 assets/anon_src.png
 assets/anon_mask.png
 assets/anon_anchors.json
+assets/anon_rig.npz
+assets/anon_rig3d.npz
